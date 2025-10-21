@@ -1,2 +1,5 @@
 .venv
 data
+dummy_data
+checkpoints
+__pycache__
