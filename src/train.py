@@ -17,7 +17,7 @@ from torch.optim import Adam
 
 from sklearn.metrics import mean_squared_error
 
-from datasets import MLPDataset, LSTMDataset
+from datasets import MLPPolars, LSTMPolars
 from model import MLP, LSTM
 
 # ---------------------
@@ -40,11 +40,11 @@ os.makedirs(args.save_dir, exist_ok=True)
 torch.device(args.device)
 
 if args.arch == "mlp":
-    train_ds = MLPDataset(Path(args.data_dir) / "X_train.npy", Path(args.data_dir) / "y_train.npy")
-    val_ds   = MLPDataset(Path(args.data_dir) / "X_val.npy",   Path(args.data_dir) / "y_val.npy")
+    train_ds = MLPPolars(Path(args.data_dir) / "X.parquet", Path(args.data_dir) / "y.parquet")
+    val_ds   = MLPPolars(Path(args.data_dir) / "X.parquet",   Path(args.data_dir) / "y.parquet")
 elif args.arch == "lstm":
-    train_ds = LSTMDataset(Path(args.data_dir) / "X_train.npy", Path(args.data_dir) / "y_train.npy", sequence_length=args.seq_len)
-    val_ds   = LSTMDataset(Path(args.data_dir) / "X_val.npy",   Path(args.data_dir) / "y_val.npy",sequence_length=args.seq_len)
+    train_ds = LSTMPolars(Path(args.data_dir) / "X.parquet", Path(args.data_dir) / "y.parquet", sequence_length=args.seq_len)
+    val_ds   = LSTMPolars(Path(args.data_dir) / "X.parquet",   Path(args.data_dir) / "y.parquet",sequence_length=args.seq_len)
 train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=False)
 val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False)
 
@@ -95,8 +95,8 @@ def validate(model, loader, device):
             out = model(xb)
             preds.append(out.cpu().numpy())
             ys.append(yb.cpu().numpy())
-    y_true = np.concatenate(ys, axis=0)
-    y_pred = np.concatenate(preds, axis=0)
+    y_true = np.concatenate(ys, axis=0).reshape(-1,1)
+    y_pred = np.concatenate(preds, axis=0).reshape(-1,1)
     rmse = np.sqrt(mean_squared_error(y_true, y_pred))
     return rmse
 
@@ -112,7 +112,7 @@ for epoch in range(1, args.epochs + 1):
         xb, yb = xb.to(args.device), yb.to(args.device)
         optimizer.zero_grad()
         out = model(xb)
-        loss = criterion(out, yb.view(-1,1))
+        loss = criterion(out, yb)
         loss.backward()
         optimizer.step()
         epoch_losses.append(loss.item())
