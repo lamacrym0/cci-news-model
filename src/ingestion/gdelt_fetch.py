@@ -30,6 +30,8 @@ COLUMN_INDEX_MAP = {
     "NumMentions": 31,
     "AvgTone": 34,
     "ActionGeo_CountryCode": 53,
+    "Actor1Geo_CountryCode": 37,
+    "Actor2Geo_CountryCode": 45
 }
 
 COLUMN_INDICES = list(COLUMN_INDEX_MAP.values())
@@ -81,7 +83,7 @@ def iter_urls_by_month(min_month: int, max_month: int) -> Iterator[Tuple[int, st
 def download_and_append(url: str, month: int):
     raw_path = PROCESSED_DIR / f"{month}_raw.parquet"
     try:
-        with requests.get(url, stream=True, timeout=30) as r:
+        with requests.get(url, stream=True, timeout=30) as r: # stream is useless bcse of zipfile i guess
             r.raise_for_status()
             with zipfile.ZipFile(io.BytesIO(r.content)) as z:
                 csv_name = z.namelist()[0]
@@ -99,10 +101,16 @@ def download_and_append(url: str, month: int):
                             "NumMentions": pl.Int32,
                             "AvgTone": pl.Float64,
                             "ActionGeo_CountryCode": pl.Utf8,
+                            "Actor1Geo_CountryCode": pl.Utf8,
+                            "Actor2Geo_CountryCode": pl.Utf8
                         },
                         null_values=["", "NULL"]
                     )
-                    df = df.filter(pl.col("ActionGeo_CountryCode").is_in(COUNTRIES_FIPS))
+                    df = df.filter(
+                        pl.col("ActionGeo_CountryCode").is_in(COUNTRIES_FIPS) |
+                        pl.col("Actor1Geo_CountryCode").is_in(COUNTRIES_FIPS) |
+                        pl.col("Actor2Geo_CountryCode").is_in(COUNTRIES_FIPS)
+                    )
                     if df.is_empty():
                         return
 
