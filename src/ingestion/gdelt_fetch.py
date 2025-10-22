@@ -193,7 +193,7 @@ def main():
     print(f"\n{len(url_list)} files to download.\n")
 
     # === PARALLEL DOWNLOAD (8 threads) ===
-    with ThreadPoolExecutor(max_workers=8) as executor:
+    with ThreadPoolExecutor(max_workers=48) as executor:
         futures = [
             executor.submit(download_and_append, url, month)
             for month, url in url_list
