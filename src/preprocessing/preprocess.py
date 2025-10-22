@@ -1,146 +1,198 @@
+# src/preprocessing/preprocess.py
+# Preprocessing pipeline: GDELT Events + CCI → X.parquet / y.parquet
+# Fully lazy, robust, no silent crashes, memory-safe
 import polars as pl
 from pathlib import Path
+from typing import List, Dict
+import sys
 
-cci = pl.scan_csv('../data/CCI_OCDE.csv',separator=',').select(pl.col(['TIME_PERIOD','REF_AREA','OBS_VALUE']))
-cci.collect().write_parquet('../data/cci_ocde.parquet')
+# === CONFIGURATION ===
+CCI_PATH = Path("data/CCI_OCDE.csv")
+EVENTS_DIR = Path("data/events")
+OUTPUT_DIR = Path("data/rows")
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
+# FIPS mapping: Alpha-3 → FIPS (2-letter)
+ALPHA3_TO_FIPS: Dict[str, str] = {
+    "CHL": "CL", "CRI": "CR", "POL": "PL", "PRT": "PT", "LTU": "LT",
+    "CHN": "CH", "ITA": "IT", "FIN": "FI", "LUX": "LU", "RUS": "RU",
+    "BRA": "BR", "AUT": "AT", "BEL": "BE", "CHE": "SZ", "HUN": "HU",
+    "DEU": "GM", "MEX": "MX", "GRC": "GR", "GBR": "UK", "COL": "CO",
+    "JPN": "JA", "SWE": "SW", "IND": "IN", "KOR": "KS", "TUR": "TU",
+    "ISR": "IS", "AUS": "AS", "FRA": "FR", "NLD": "NL", "LVA": "LV",
+    "SVK": "LO", "CZE": "EZ", "IDN": "ID", "EST": "EN", "USA": "US",
+    "DNK": "DK", "IRL": "EI", "ZAF": "SA", "ESP": "SP", "NZL": "NZ", "SVN": "SI"
+}
 
-# collect distinct months as python strings
-months = cci.select(pl.col("TIME_PERIOD")).unique().collect().to_numpy()
+# === 1. LOAD CCI DATA ===
+print("Loading CCI data...")
+if not CCI_PATH.exists():
+    print(f"[ERROR] CCI file not found: {CCI_PATH}")
+    sys.exit(1)
 
-results = []  # collect eager DataFrames here
-events_dir = Path(f"../data/events/")
+cci = (
+    pl.scan_csv(str(CCI_PATH), separator=",")
+    .select(["TIME_PERIOD", "REF_AREA", "OBS_VALUE"])
+    .with_columns([
+        pl.col("TIME_PERIOD").str.to_date("%Y-%m", strict=False),
+        pl.col("OBS_VALUE").cast(pl.Float64, strict=False)
+    ])
+    .filter(pl.col("TIME_PERIOD").is_not_null())
+)
 
-for month in months:
-    # filter the month from cci and prepare SQLDATE column (eager)
+# Cache intermediate
+cci.collect().write_parquet("data/cci_ocde.parquet")
+
+# === 2. GET UNIQUE MONTHS (as strings: "2021-11") ===
+print("Extracting unique months from CCI...")
+months_df = cci.select("TIME_PERIOD").unique().collect()
+
+if months_df.is_empty():
+    print("[ERROR] No valid months found in CCI data.")
+    sys.exit(1)
+
+months: List[str] = months_df["TIME_PERIOD"].dt.strftime("%Y-%m").to_list()
+print(f"Found {len(months)} months to process.")
+
+# === 3. PROCESS EACH MONTH: JOIN EVENTS + CCI ===
+print("Joining GDELT events with CCI by month...")
+results = []
+
+for month_str in months:  # e.g., "2021-11"
+    yyyymm = month_str.replace("-", "")  # e.g., "202111"
+
+    # --- CCI slice for this month ---
     cci_month = (
-        cci
-        .filter(pl.col("TIME_PERIOD") == month)
-        .with_columns(pl.col("TIME_PERIOD").alias("DATE"))
+        cci.filter(pl.col("TIME_PERIOD") == month_str)
+        .with_columns(pl.lit(month_str).alias("DATE"))
         .drop("TIME_PERIOD")
+        .collect()  # Small: one month → safe
     )
-    month = month[0].replace('-','')
 
-    # ensure path matches parquet files; use glob if directory contains many files
-    
-    parquet_files = list(events_dir.glob(f"{month}.parquet"))
-
-    if not parquet_files:
-        # skip this month if no parquet files found
-        print(f"Warning: no event files for month {month}, skipping")
+    if cci_month.is_empty():
+        print(f"Warning: no CCI data for month {month_str}, skipping")
         continue
-    
-    events_path = str(events_dir) + f"/{month}.parquet"
-    # scan_parquet returns a LazyFrame; join lazily against the small eager cci_month by turning it into a lazy frame
-    dx = pl.scan_parquet(events_path)
+
+    # --- Find event file ---
+    parquet_files = list(EVENTS_DIR.glob(f"{yyyymm}.parquet"))
+    if not parquet_files:
+        print(f"Warning: no event files for month {yyyymm}, skipping")
+        continue
+
+    events_path = parquet_files[0]
+    try:
+        dx = pl.scan_parquet(str(events_path))
+    except Exception as e:
+        print(f"[ERROR] Failed to read {events_path}: {e}")
+        continue
+
+    # --- Transform SQLDATE → DATE (YYYY-MM) ---
     dx = dx.with_columns(
         pl.col("SQLDATE")
         .cast(pl.Utf8)
-        .str.to_date("%Y%m%d", strict=False)
+        .str.strptime(pl.Date, "%Y%m%d", strict=False)
         .dt.strftime("%Y-%m")
         .alias("DATE")
     ).drop("SQLDATE")
-    joined_lazy = dx.join(cci_month, on="DATE", how="inner")
 
-    # collect the joined partition into memory and append
-    joined = joined_lazy.collect()
-    results.append(joined)
-
-# concatenate all month-level results and write once
-if results:
-    all_rows = pl.concat(results, how="vertical")
-    Path("../data/rows").mkdir(parents=True, exist_ok=True)
-    all_rows.write_parquet("../data/rows/data.parquet")
-    all_rows.select(pl.col(['DATE','OBS_VALUE'])).write_parquet("../data/rows/y.parquet")
-    all_rows.select(pl.exclude(['OBS_VALUE'])).write_parquet("../data/rows/X.parquet")
-else:
-    # create empty folder and empty file if desired
-    Path("../data/rows").mkdir(parents=True, exist_ok=True)
-    pl.DataFrame().write_parquet("../data/rows/data.parquet")
-
-data = pl.scan_parquet('../data/rows/data.parquet')
-
-# Input alpha-3 list
-alpha3_list = [
-    "CHL","CRI","POL","PRT","LTU","CHN","ITA","FIN","LUX","RUS",
-    "BRA","AUT","BEL","CHE","HUN","DEU","MEX","GRC","GBR","COL",
-    "JPN","SWE","IND","KOR","TUR","ISR","AUS","FRA","NLD","LVA",
-    "SVK","CZE","IDN","EST","USA","DNK","IRL","ZAF","ESP","NZL","SVN"
-]
-
-# FIPS mapping dictionary (Alpha-3 -> FIPS two-letter)
-alpha3_to_fips = {
-    "CHL":"CL","CRI":"CR","POL":"PL","PRT":"PT","LTU":"LT",
-    "CHN":"CH","ITA":"IT","FIN":"FI","LUX":"LU","RUS":"RU",
-    "BRA":"BR","AUT":"AT","BEL":"BE","CHE":"SZ","HUN":"HU",
-    "DEU":"GM","MEX":"MX","GRC":"GR","GBR":"UK","COL":"CO",
-    "JPN":"JA","SWE":"SW","IND":"IN","KOR":"KS","TUR":"TU",
-    "ISR":"IS","AUS":"AS","FRA":"FR","NLD":"NL","LVA":"LV",
-    "SVK":"LO","CZE":"EZ","IDN":"ID","EST":"EN","USA":"US",
-    "DNK":"DK","IRL":"EI","ZAF":"SA","ESP":"SP","NZL":"NZ","SVN":"SI"
-}
-
-# Map alpha-3 -> fips and add as new column
-data = (
-    data
-    .with_columns(
-        pl.col("REF_AREA").replace(alpha3_to_fips, default="UNKNOWN").alias("REF_AREA")
+    # --- Lazy inner join on DATE ---
+    joined = dx.join(
+        pl.LazyFrame(cci_month),
+        on="DATE",
+        how="inner"
     )
-)
-data = data.filter(pl.col('REF_AREA') == pl.col('ActionGeo_CountryCode'))
 
-df = data.with_columns([
-    pl.col("EventCode").cast(str).str.strip_chars().alias("EventCode_clean")
-])
+    results.append(joined.collect())
 
-# Group by REF_AREA and index (month), then pivot
-agg_df = df.group_by(["REF_AREA", "DATE", "EventCode_clean",'OBS_VALUE']).agg([
-    pl.col("NumMentions").sum().alias("NumMentions_sum"),
-    pl.col("AvgTone").mean().alias("AvgTone_mean")
-])
+# === 4. CONCAT ALL MONTHS ===
+if not results:
+    print("No joined data found. Creating empty output.")
+    empty_df = pl.DataFrame()
+    empty_df.write_parquet(str(OUTPUT_DIR / "data.parquet"))
+    empty_df.write_parquet(str(OUTPUT_DIR / "X.parquet"))
+    empty_df.write_parquet(str(OUTPUT_DIR / "y.parquet"))
+    sys.exit(0)
 
-# Pivot so each EventCode becomes a column
-pivot_mentions = agg_df.collect().pivot(
-    values="NumMentions_sum",
-    index=["REF_AREA", "DATE",'OBS_VALUE'],
-    columns="EventCode_clean",
-)
+print("Concatenating all monthly results...")
+all_rows = pl.concat(results, how="vertical")
+all_rows.write_parquet(str(OUTPUT_DIR / "data.parquet"))
 
-pivot_tone = agg_df.collect().pivot(
-    values="AvgTone_mean",
-    index=["REF_AREA", "DATE",'OBS_VALUE'],
-    columns="EventCode_clean"
-)
-pivot_mentions = pivot_mentions.rename({
-    col: f"Mentions_{col}" for col in pivot_mentions.columns if col not in ["REF_AREA", "DATE", 'OBS_VALUE']
-})
+# === 5. FINAL PROCESSING (LAZY) ===
+print("Final aggregation and pivoting...")
+data = pl.scan_parquet(str(OUTPUT_DIR / "data.parquet"))
 
-pivot_tone = pivot_tone.rename({
-    col: f"Tone_{col}" for col in pivot_tone.columns if col not in ["REF_AREA", "DATE", 'OBS_VALUE']
-})
-pivot_mentions = pivot_mentions.fill_null(0)
-pivot_tone = pivot_tone.fill_null(0)
-
-
-# Join both pivoted tables
-final_df = pivot_mentions.join(pivot_tone, on=["REF_AREA", "DATE"]).sort(['DATE','REF_AREA'])
-
-final_df = final_df.with_columns(
-    pl.row_index().alias('index')
+# Map REF_AREA (alpha-3) → FIPS
+data = data.with_columns(
+    pl.col("REF_AREA")
+    .replace_strict(ALPHA3_TO_FIPS, default=None)
+    .alias("REF_AREA_FIPS")
 )
 
-# Step 1: Get unique REF_AREA values
+# Drop original REF_AREA and ActionGeo_CountryCode (redundant)
+data = data.drop(["REF_AREA", "ActionGeo_CountryCode"]).rename({"REF_AREA_FIPS": "REF_AREA"})
+
+# Clean EventCode
+df = data.with_columns(
+    pl.col("EventCode").cast(pl.Utf8).str.strip_chars().alias("EventCode_clean")
+).drop("EventCode")
+
+# === 6. AGGREGATE BY (REF_AREA, DATE, EventCode, OBS_VALUE) ===
+agg_df = (
+    df.group_by(["REF_AREA", "DATE", "EventCode_clean", "OBS_VALUE"])
+    .agg([
+        pl.col("NumMentions").sum().alias("NumMentions_sum"),
+        pl.col("AvgTone").mean().alias("AvgTone_mean")
+    ])
+)
+
+# === 7. PIVOT: Mentions & Tone (LAZY) ===
+print("Pivoting mentions and tone...")
+pivot_mentions = (
+    agg_df.pivot(
+        values="NumMentions_sum",
+        index=["REF_AREA", "DATE", "OBS_VALUE"],
+        columns="EventCode_clean"
+    )
+    .fill_null(0)
+    .rename(lambda col: f"Mentions_{col}" if col not in ["REF_AREA", "DATE", "OBS_VALUE"] else col)
+)
+
+pivot_tone = (
+    agg_df.pivot(
+        values="AvgTone_mean",
+        index=["REF_AREA", "DATE", "OBS_VALUE"],
+        columns="EventCode_clean"
+    )
+    .fill_null(0)
+    .rename(lambda col: f"Tone_{col}" if col not in ["REF_AREA", "DATE", "OBS_VALUE"] else col)
+)
+
+# === 8. JOIN PIVOTS + ADD INDEX ===
+final_df = pivot_mentions.join(pivot_tone, on=["REF_AREA", "DATE", "OBS_VALUE"])
+
+# Stable row index
+final_df = final_df.with_row_index("index")
+
+# === 9. ENCODE REF_AREA → Integer ID ===
 unique_areas = final_df.select("REF_AREA").unique().sort("REF_AREA")
-
-# Step 2: Create a mapping dictionary
 area_to_id = {
     area: idx for idx, area in enumerate(unique_areas["REF_AREA"].to_list())
 }
 
-# Step 3: Apply the mapping
-encoded_df = final_df.with_columns([
-    pl.col("REF_AREA").replace(area_to_id).cast(int).alias("REF_AREA")
+encoded_df = final_df.with_columns(
+    pl.col("REF_AREA").replace(area_to_id).cast(pl.Int32).alias("REF_AREA_ID")
+).drop("REF_AREA")
+
+# Reorder columns: index first
+encoded_df = encoded_df.select([
+    "index", "REF_AREA_ID", "DATE", "OBS_VALUE",
+    pl.exclude("index", "REF_AREA_ID", "DATE", "OBS_VALUE")
 ])
 
-encoded_df.select(pl.exclude('OBS_VALUE','DATE')).write_parquet('../data/rows/X.parquet')
-encoded_df.select(pl.col(['index','OBS_VALUE'])).write_parquet('../data/rows/y.parquet')
+# === 10. WRITE FINAL X / y ===
+print(f"Writing final datasets to {OUTPUT_DIR}/")
+encoded_df.select(pl.exclude("OBS_VALUE", "DATE")).write_parquet(str(OUTPUT_DIR / "X.parquet"))
+encoded_df.select(["index", "OBS_VALUE"]).write_parquet(str(OUTPUT_DIR / "y.parquet"))
+
+print(f"Done! X: {OUTPUT_DIR}/X.parquet, y: {OUTPUT_DIR}/y.parquet")
+print(f"   → {encoded_df.collect().height:,} rows, {len(encoded_df.columns)} columns")
