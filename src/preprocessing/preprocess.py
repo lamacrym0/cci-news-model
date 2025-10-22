@@ -1,8 +1,7 @@
 import polars as pl
 from pathlib import Path
 
-cci = pl.scan_csv('../data/CCI_OCDE.csv',separator=',').select(pl.col(['TIME_PERIOD','REF_AREA','OBS_VALUE']))
-cci.collect().write_parquet('../data/cci_ocde.parquet')
+cci = pl.scan_parquet('../data/cci_ocde.parquet')
 
 
 # collect distinct months as python strings
@@ -39,24 +38,30 @@ for month in months:
         .str.to_date("%Y%m%d", strict=False)
         .dt.strftime("%Y-%m")
         .alias("DATE")
-    ).drop("SQLDATE")
+    ).drop("SQLDATE").with_columns(
+        pl.when(
+            pl.col("ActionGeo_CountryCode")
+            .is_not_null())
+        .then(
+            pl.col("ActionGeo_CountryCode"))
+        .otherwise(
+            pl.col("Actor2Geo_CountryCode")
+        )
+        .alias("CountryCode")
+    ).drop(['ActionGeo_CountryCode','Actor1Geo_CountryCode','Actor2Geo_CountryCode'])
+
     joined_lazy = dx.join(cci_month, on="DATE", how="inner")
 
     # collect the joined partition into memory and append
-    joined = joined_lazy.collect()
-    results.append(joined)
+    results.append(joined_lazy)
 
 # concatenate all month-level results and write once
 if results:
     all_rows = pl.concat(results, how="vertical")
     Path("../data/rows").mkdir(parents=True, exist_ok=True)
-    all_rows.write_parquet("../data/rows/data.parquet")
-    all_rows.select(pl.col(['DATE','OBS_VALUE'])).write_parquet("../data/rows/y.parquet")
-    all_rows.select(pl.exclude(['OBS_VALUE'])).write_parquet("../data/rows/X.parquet")
+    all_rows.collect().write_parquet("../data/rows/data.parquet")
 else:
-    # create empty folder and empty file if desired
-    Path("../data/rows").mkdir(parents=True, exist_ok=True)
-    pl.DataFrame().write_parquet("../data/rows/data.parquet")
+    NameError("Missing Value GDELT or CCI OCDE")
 
 data = pl.scan_parquet('../data/rows/data.parquet')
 
@@ -87,7 +92,8 @@ data = (
         pl.col("REF_AREA").replace(alpha3_to_fips, default="UNKNOWN").alias("REF_AREA")
     )
 )
-data = data.filter(pl.col('REF_AREA') == pl.col('ActionGeo_CountryCode'))
+
+data = data.filter(pl.col('REF_AREA') == pl.col('CountryCode'))
 
 df = data.with_columns([
     pl.col("EventCode").cast(str).str.strip_chars().alias("EventCode_clean")
