@@ -1,14 +1,14 @@
 import polars as pl
 from pathlib import Path
 
-cci = pl.scan_parquet('../data/cci_ocde.parquet')
+cci = pl.scan_parquet('data/cci_ocde.parquet')
 
 
 # collect distinct months as python strings
 months = cci.select(pl.col("TIME_PERIOD")).unique().collect().to_numpy()
 
 results = []  # collect eager DataFrames here
-events_dir = Path(f"../data/events/")
+events_dir = Path(f"data/events/")
 
 for month in months:
     # filter the month from cci and prepare SQLDATE column (eager)
@@ -53,17 +53,20 @@ for month in months:
     joined_lazy = dx.join(cci_month, on="DATE", how="inner")
 
     # collect the joined partition into memory and append
-    results.append(joined_lazy)
+    joined = joined_lazy.collect()
+    results.append(joined)
+
 
 # concatenate all month-level results and write once
 if results:
     all_rows = pl.concat(results, how="vertical")
-    Path("../data/rows").mkdir(parents=True, exist_ok=True)
-    all_rows.collect().write_parquet("../data/rows/data.parquet")
+    Path("data/rows").mkdir(parents=True, exist_ok=True)
+    all_rows.write_parquet("data/rows/data.parquet")
 else:
     NameError("Missing Value GDELT or CCI OCDE")
 
-data = pl.scan_parquet('../data/rows/data.parquet')
+print("Data saved")
+data = pl.scan_parquet('data/rows/data.parquet')
 
 # Input alpha-3 list
 alpha3_list = [
@@ -136,11 +139,11 @@ final_df = final_df.with_columns(
 )
 
 # Step 1: Get unique REF_AREA values
-unique_areas = final_df.select("REF_AREA").unique().sort("REF_AREA")
+unique_areas = final_df.select("REF_AREA").unique().sort("REF_AREA").to_list()
 
 # Step 2: Create a mapping dictionary
 area_to_id = {
-    area: idx for idx, area in enumerate(unique_areas["REF_AREA"].to_list())
+    area: idx for idx, area in enumerate(unique_areas)
 }
 
 # Step 3: Apply the mapping
@@ -148,5 +151,7 @@ encoded_df = final_df.with_columns([
     pl.col("REF_AREA").replace(area_to_id).cast(int).alias("REF_AREA")
 ])
 
-encoded_df.select(pl.exclude('OBS_VALUE','DATE')).write_parquet('../data/rows/X.parquet')
-encoded_df.select(pl.col(['index','OBS_VALUE'])).write_parquet('../data/rows/y.parquet')
+print("Save final data")
+
+encoded_df.select(pl.exclude('OBS_VALUE','DATE')).write_parquet('data/rows/X.parquet')
+encoded_df.select(pl.col(['index','OBS_VALUE'])).write_parquet('data/rows/y.parquet')
