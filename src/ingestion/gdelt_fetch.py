@@ -97,7 +97,7 @@ def download_and_append(url: str, month: int):
                         schema_overrides={
                             "GLOBALEVENTID": pl.Int64,
                             "SQLDATE": pl.Int32,
-                            "EventCode": pl.Int32,
+                            "EventCode": pl.Utf8,
                             "NumMentions": pl.Int32,
                             "AvgTone": pl.Float64,
                             "ActionGeo_CountryCode": pl.Utf8,
