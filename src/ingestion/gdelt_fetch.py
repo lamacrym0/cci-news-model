@@ -1,28 +1,18 @@
 # src/ingestion/gdelt_fetch.py
-# Scalable & parallel GDELT Events ingestion (RAM-safe, 8 threads)
+# GDELT Events ingestion — Optimized, streaming, batched, server-proof
 import polars as pl
 from pathlib import Path
 import zipfile
-import io
+import tempfile
 import requests
 import re
 from tqdm import tqdm
-from typing import Iterator, Tuple
+from typing import Iterator, Tuple, List
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import pyarrow as pa
-import pyarrow.parquet as pq
+from collections import defaultdict
+import shutil
 
 # === GDELT CONFIGURATION ===
-COLUMNS_TO_KEEP = [
-    "GLOBALEVENTID",
-    "SQLDATE",
-    "EventCode",
-    "NumMentions",
-    "AvgTone",
-    "ActionGeo_CountryCode",
-]
-
-# Column indices (0-based) from GDELT 2.0 Events schema (verified on real file)
 COLUMN_INDEX_MAP = {
     "GLOBALEVENTID": 0,
     "SQLDATE": 1,
@@ -33,7 +23,6 @@ COLUMN_INDEX_MAP = {
     "Actor1Geo_CountryCode": 37,
     "Actor2Geo_CountryCode": 45
 }
-
 COLUMN_INDICES = list(COLUMN_INDEX_MAP.values())
 COLUMN_NAMES = list(COLUMN_INDEX_MAP.keys())
 
@@ -55,7 +44,7 @@ PROCESSED_DIR = DATA_DIR / "processed" / "events_by_month_filtered"
 PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
 URLS_PARQUET = DATA_DIR / "gdelt_events_urls.parquet"
 
-# === 1. Extract month from URL (supports .translation.export.CSV.zip) ===
+# === 1. Extract month from URL ===
 def url_to_month(url: str) -> int:
     match = re.search(r"(\d{8})\d{6}\.(?:translation\.)?export\.CSV\.zip$", url)
     return int(match.group(1)[:6]) if match else 0
@@ -73,141 +62,130 @@ def iter_urls_by_month(min_month: int, max_month: int) -> Iterator[Tuple[int, st
     for url in urls:
         month = url_to_month(url)
         if month == 0:
-            continue  # Skip malformed URLs
+            continue
         if min_month <= month <= max_month:
             yield month, url
             filtered_count += 1
-    print(f"{filtered_count} URLs match the date range [{min_month} - {max_month}]")
+    print(f"{filtered_count} URLs match date range [{min_month} - {max_month}]")
 
-# === 3. Download + extract + filter + append to Parquet (disk-based) ===
-def download_and_append(url: str, month: int):
-    raw_path = PROCESSED_DIR / f"{month}_raw.parquet"
+# === 3. Download + stream + parse + collect per month ===
+def download_and_collect(url: str) -> Tuple[int, pl.DataFrame]:
+    month = url_to_month(url)
+    if month == 0:
+        return month, pl.DataFrame()
+
     try:
-        with requests.get(url, stream=True, timeout=30) as r: # stream is useless bcse of zipfile i guess
-            r.raise_for_status()
-            with zipfile.ZipFile(io.BytesIO(r.content)) as z:
-                csv_name = z.namelist()[0]
-                with z.open(csv_name) as f:
-                    df = pl.read_csv(
-                        f,
-                        separator="\t",
-                        has_header=False,
-                        columns=COLUMN_INDICES,
-                        new_columns=COLUMN_NAMES,
-                        dtypes=[
-                            pl.Int64,   # GLOBALEVENTID
-                            pl.Int32,   # SQLDATE
-                            pl.Utf8,    # EventCode
-                            pl.Int32,   # NumMentions
-                            pl.Float64, # AvgTone
-                            pl.Utf8,    # ActionGeo_CountryCode
-                            pl.Utf8,    # Actor1Geo_CountryCode
-                            pl.Utf8     # Actor2Geo_CountryCode
-                        ],
-                        null_values=["", "NULL"]
-                    )
-                    df = df.filter(
-                        pl.col("ActionGeo_CountryCode").is_in(COUNTRIES_FIPS) |
-                        pl.col("Actor1Geo_CountryCode").is_in(COUNTRIES_FIPS) |
-                        pl.col("Actor2Geo_CountryCode").is_in(COUNTRIES_FIPS)
-                    )
-                    if df.is_empty():
-                        return
+        # Streaming download to temp file
+        with tempfile.NamedTemporaryFile(delete=False) as tmp:
+            with requests.get(url, stream=True, timeout=60) as r:
+                r.raise_for_status()
+                for chunk in r.iter_content(chunk_size=8192):
+                    if chunk:
+                        tmp.write(chunk)
+            tmp_path = tmp.name
 
-                    table = df.to_arrow()
+        # Extract and parse
+        with zipfile.ZipFile(tmp_path) as z:
+            with z.open(z.namelist()[0]) as f:
+                df = pl.read_csv(
+                    f,
+                    separator="\t",
+                    has_header=False,
+                    columns=COLUMN_INDICES,
+                    new_columns=COLUMN_NAMES,
+                    dtypes=[
+                        pl.Int64, pl.Int32, pl.Utf8, pl.Int32,
+                        pl.Float64, pl.Utf8, pl.Utf8, pl.Utf8
+                    ],
+                    null_values=["", "NULL"]
+                )
+                df = df.filter(
+                    pl.col("ActionGeo_CountryCode").is_in(COUNTRIES_FIPS) |
+                    pl.col("Actor1Geo_CountryCode").is_in(COUNTRIES_FIPS) |
+                    pl.col("Actor2Geo_CountryCode").is_in(COUNTRIES_FIPS)
+                )
+        # Clean up
+        Path(tmp_path).unlink(missing_ok=True)
+        return month, df
 
-                    # THREAD-SAFE APPEND
-                    if raw_path.exists():
-                        writer = pq.ParquetWriter(raw_path, table.schema)
-                        writer.write_table(table)
-                        writer.close()
-                    else:
-                        pq.write_table(table, raw_path, compression="zstd")
     except Exception as e:
         print(f"[ERROR] Failed {url}: {e}")
+        return month, pl.DataFrame()
 
-# === 4. Final deduplication per month ===
-def deduplicate_month(month: int):
-    raw_path = PROCESSED_DIR / f"{month}_raw.parquet"
-    final_path = PROCESSED_DIR / f"{month}.parquet"
-    if not raw_path.exists():
+# === 4. Process one month: collect, concat, dedup, write ===
+def process_month(month: int, urls: List[str]):
+    print(f"Processing month {month} ({len(urls)} files)...")
+    dfs = []
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = [executor.submit(download_and_collect, url) for url in urls]
+        for future in tqdm(as_completed(futures), total=len(futures), desc=f"Month {month}", leave=False):
+            _, df = future.result()
+            if not df.is_empty():
+                dfs.append(df)
+
+    if not dfs:
+        print(f"{month}: No data after filtering.")
         return
-    try:
-        df = pl.read_parquet(raw_path)
-        before = len(df)
-        df = df.unique(subset="GLOBALEVENTID", maintain_order=True)
-        after = len(df)
-        df.write_parquet(final_path, compression="zstd")
-        raw_path.unlink()  # Clean up
-        print(f"{month}.parquet → {after:,} unique events ({before - after:,} duplicates removed)")
-    except Exception as e:
-        print(f"[ERROR] Deduplication failed for {month}: {e}")
 
-# === 5. Schema test on a real file ===
+    # Concat + deduplicate
+    df_month = pl.concat(dfs)
+    before = len(df_month)
+    df_month = df_month.unique(subset="GLOBALEVENTID", maintain_order=True)
+    after = len(df_month)
+
+    # Write final Parquet
+    final_path = PROCESSED_DIR / f"{month}.parquet"
+    df_month.write_parquet(final_path, compression="zstd", compression_level=3)
+    print(f"{month}.parquet → {after:,} events ({before - after:,} duplicates removed)")
+
+# === 5. Schema test ===
 def test_schema() -> bool:
     test_url = "http://data.gdeltproject.org/gdeltv2/20241001000000.export.CSV.zip"
     print(f"\nTesting schema on: {test_url}")
     try:
-        with requests.get(test_url, stream=True, timeout=30) as r:
-            r.raise_for_status()
-            with zipfile.ZipFile(io.BytesIO(r.content)) as z:
-                with z.open(z.namelist()[0]) as f:
-                    df = pl.read_csv(
-                        f, separator="\t",
-                        has_header=False,
-                        columns=COLUMN_INDICES,
-                        new_columns=COLUMN_NAMES,
-                        dtypes=[
-                            pl.Int64,   # GLOBALEVENTID
-                            pl.Int32,   # SQLDATE
-                            pl.Utf8,    # EventCode
-                            pl.Int32,   # NumMentions
-                            pl.Float64, # AvgTone
-                            pl.Utf8,    # ActionGeo_CountryCode
-                            pl.Utf8,    # Actor1Geo_CountryCode
-                            pl.Utf8     # Actor2Geo_CountryCode
-                        ]
-                    ).filter(pl.col("ActionGeo_CountryCode").is_in(COUNTRIES_FIPS))
-                    print(f"OK: {len(df)} rows extracted")
-                    print(f"Sample: {df.row(0, named=True)}")
-                    return True
+        month, df = download_and_collect(test_url)
+        if df.is_empty():
+            print("No rows match country filter.")
+        else:
+            print(f"OK: {len(df)} rows extracted")
+            print(f"Sample: {df.row(0, named=True)}")
+        return True
     except Exception as e:
         print(f"Schema test failed: {e}")
         return False
 
-# === 6. Main: parallel + disk-safe ===
+# === 6. Main ===
 def main():
-    print(f"Starting processing: {START_MONTH} → {END_MONTH}")
-    print(f"Columns & indices: {dict(zip(COLUMN_NAMES, COLUMN_INDICES))}")
+    print(f"Starting GDELT ingestion: {START_MONTH} → {END_MONTH}")
+    print(f"Output → {PROCESSED_DIR.resolve()}")
     print(f"Countries filtered: {len(COUNTRIES_FIPS)} FIPS codes\n")
 
     if not test_schema():
         print("Stopping: fix parsing first.")
         return
 
-    # Generate URL list
-    url_list = list(iter_urls_by_month(START_MONTH, END_MONTH))
-    if not url_list:
-        print("No files to process. Check date range and URL column.")
-        return
-    print(f"\n{len(url_list)} files to download.\n")
+    # Group URLs by month
+    url_by_month = defaultdict(list)
+    for month, url in iter_urls_by_month(START_MONTH, END_MONTH):
+        url_by_month[month].append(url)
 
-    # === PARALLEL DOWNLOAD (8 threads) ===
-    with ThreadPoolExecutor(max_workers=48) as executor:
+    if not url_by_month:
+        print("No files to process.")
+        return
+
+    print(f"\n{len(url_by_month)} months to process\n")
+
+    # Process months in parallel (one thread per month)
+    with ThreadPoolExecutor(max_workers=8) as executor:
         futures = [
-            executor.submit(download_and_append, url, month)
-            for month, url in url_list
+            executor.submit(process_month, month, urls)
+            for month, urls in sorted(url_by_month.items())
         ]
-        for _ in tqdm(as_completed(futures), total=len(futures), desc="Downloading", unit="file"):
+        for _ in tqdm(as_completed(futures), total=len(futures), desc="Months"):
             pass
 
-    # === DEDUPLICATION ===
-    print("\nDeduplicating monthly files...")
-    months = sorted({month for month, _ in url_list})
-    for month in months:
-        deduplicate_month(month)
-
-    print(f"\nDone! {len(months)} months processed.")
+    print(f"\nDone! Processed {len(url_by_month)} months.")
     print(f"Output: {PROCESSED_DIR.resolve()}")
 
 if __name__ == "__main__":
