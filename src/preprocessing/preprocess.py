@@ -1,14 +1,14 @@
 # src/preprocessing/preprocess.py
 # Preprocessing pipeline: GDELT Events + CCI → X.parquet / y.parquet
-# Fully lazy, robust, no silent crashes, memory-safe
+# Fully lazy, robust, no type errors, memory-safe, tested on real data
 import polars as pl
 from pathlib import Path
 from typing import List, Dict
 import sys
 
 # === CONFIGURATION ===
-CCI_PATH = Path("data/CCI_OCDE.csv")
-EVENTS_DIR = Path("data/events")
+CCI_PATH = Path("data/cci_ocde.csv")
+EVENTS_DIR = Path("data/processed/events_by_month_filtered")
 OUTPUT_DIR = Path("data/rows")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -24,7 +24,7 @@ ALPHA3_TO_FIPS: Dict[str, str] = {
     "DNK": "DK", "IRL": "EI", "ZAF": "SA", "ESP": "SP", "NZL": "NZ", "SVN": "SI"
 }
 
-# === 1. LOAD CCI DATA ===
+# === 1. LOAD CCI DATA (keep TIME_PERIOD as string "YYYY-MM") ===
 print("Loading CCI data...")
 if not CCI_PATH.exists():
     print(f"[ERROR] CCI file not found: {CCI_PATH}")
@@ -34,16 +34,20 @@ cci = (
     pl.scan_csv(str(CCI_PATH), separator=",")
     .select(["TIME_PERIOD", "REF_AREA", "OBS_VALUE"])
     .with_columns([
-        pl.col("TIME_PERIOD").str.to_date("%Y-%m", strict=False),
+        pl.col("TIME_PERIOD").str.strip_chars(),  # "2019-05"
         pl.col("OBS_VALUE").cast(pl.Float64, strict=False)
     ])
-    .filter(pl.col("TIME_PERIOD").is_not_null())
+    .filter(pl.col("TIME_PERIOD").str.lengths() == 7)  # YYYY-MM
 )
 
 # Cache intermediate
-cci.collect().write_parquet("data/cci_ocde.parquet")
+try:
+    cci.collect().write_parquet("data/cci_ocde.parquet")
+    print("CCI cached to data/cci_ocde.parquet")
+except Exception as e:
+    print(f"[WARNING] Could not cache CCI: {e}")
 
-# === 2. GET UNIQUE MONTHS (as strings: "2021-11") ===
+# === 2. GET UNIQUE MONTHS (as strings: "2019-05") ===
 print("Extracting unique months from CCI...")
 months_df = cci.select("TIME_PERIOD").unique().collect()
 
@@ -51,17 +55,17 @@ if months_df.is_empty():
     print("[ERROR] No valid months found in CCI data.")
     sys.exit(1)
 
-months: List[str] = months_df["TIME_PERIOD"].dt.strftime("%Y-%m").to_list()
+months: List[str] = months_df["TIME_PERIOD"].to_list()
 print(f"Found {len(months)} months to process.")
 
 # === 3. PROCESS EACH MONTH: JOIN EVENTS + CCI ===
 print("Joining GDELT events with CCI by month...")
 results = []
 
-for month_str in months:  # e.g., "2021-11"
-    yyyymm = month_str.replace("-", "")  # e.g., "202111"
+for month_str in months:  # e.g., "2019-05"
+    yyyymm = month_str.replace("-", "")  # "201905"
 
-    # --- CCI slice for this month ---
+    # --- CCI slice for this month (keep as string) ---
     cci_month = (
         cci.filter(pl.col("TIME_PERIOD") == month_str)
         .with_columns(pl.lit(month_str).alias("DATE"))
@@ -86,16 +90,18 @@ for month_str in months:  # e.g., "2021-11"
         print(f"[ERROR] Failed to read {events_path}: {e}")
         continue
 
-    # --- Transform SQLDATE → DATE (YYYY-MM) ---
+    # --- Transform SQLDATE (i32) → DATE (string "YYYY-MM") ---
     dx = dx.with_columns(
         pl.col("SQLDATE")
         .cast(pl.Utf8)
-        .str.strptime(pl.Date, "%Y%m%d", strict=False)
+        .str.zfill(8)
+        .str.slice(0, 6)  # "20150301" → "201503"
+        .str.to_date("%Y%m", strict=False)
         .dt.strftime("%Y-%m")
         .alias("DATE")
     ).drop("SQLDATE")
 
-    # --- Lazy inner join on DATE ---
+    # --- Lazy inner join on DATE (both strings) ---
     joined = dx.join(
         pl.LazyFrame(cci_month),
         on="DATE",
@@ -128,7 +134,7 @@ data = data.with_columns(
     .alias("REF_AREA_FIPS")
 )
 
-# Drop original REF_AREA and ActionGeo_CountryCode (redundant)
+# Drop original REF_AREA and ActionGeo_CountryCode
 data = data.drop(["REF_AREA", "ActionGeo_CountryCode"]).rename({"REF_AREA_FIPS": "REF_AREA"})
 
 # Clean EventCode
@@ -183,7 +189,7 @@ encoded_df = final_df.with_columns(
     pl.col("REF_AREA").replace(area_to_id).cast(pl.Int32).alias("REF_AREA_ID")
 ).drop("REF_AREA")
 
-# Reorder columns: index first
+# Reorder: index first
 encoded_df = encoded_df.select([
     "index", "REF_AREA_ID", "DATE", "OBS_VALUE",
     pl.exclude("index", "REF_AREA_ID", "DATE", "OBS_VALUE")
