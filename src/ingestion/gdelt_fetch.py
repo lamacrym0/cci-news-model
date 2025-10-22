@@ -94,16 +94,16 @@ def download_and_append(url: str, month: int):
                         has_header=False,
                         columns=COLUMN_INDICES,
                         new_columns=COLUMN_NAMES,
-                        schema_overrides={
-                            "GLOBALEVENTID": pl.Int64,
-                            "SQLDATE": pl.Int32,
-                            "EventCode": pl.Utf8,
-                            "NumMentions": pl.Int32,
-                            "AvgTone": pl.Float64,
-                            "ActionGeo_CountryCode": pl.Utf8,
-                            "Actor1Geo_CountryCode": pl.Utf8,
-                            "Actor2Geo_CountryCode": pl.Utf8
-                        },
+                        dtypes=[
+                            pl.Int64,   # GLOBALEVENTID
+                            pl.Int32,   # SQLDATE
+                            pl.Utf8,    # EventCode
+                            pl.Int32,   # NumMentions
+                            pl.Float64, # AvgTone
+                            pl.Utf8,    # ActionGeo_CountryCode
+                            pl.Utf8,    # Actor1Geo_CountryCode
+                            pl.Utf8     # Actor2Geo_CountryCode
+                        ],
                         null_values=["", "NULL"]
                     )
                     df = df.filter(
@@ -153,10 +153,20 @@ def test_schema() -> bool:
             with zipfile.ZipFile(io.BytesIO(r.content)) as z:
                 with z.open(z.namelist()[0]) as f:
                     df = pl.read_csv(
-                        f, separator="\t", has_header=False,
-                        columns=COLUMN_INDICES, new_columns=COLUMN_NAMES,
-                        schema_overrides={k: v for k, v in zip(COLUMN_NAMES,
-                            [pl.Int64, pl.Int32, pl.Int32, pl.Int32, pl.Float64, pl.Utf8])}
+                        f, separator="\t",
+                        has_header=False,
+                        columns=COLUMN_INDICES,
+                        new_columns=COLUMN_NAMES,
+                        dtypes=[
+                            pl.Int64,   # GLOBALEVENTID
+                            pl.Int32,   # SQLDATE
+                            pl.Utf8,    # EventCode
+                            pl.Int32,   # NumMentions
+                            pl.Float64, # AvgTone
+                            pl.Utf8,    # ActionGeo_CountryCode
+                            pl.Utf8,    # Actor1Geo_CountryCode
+                            pl.Utf8     # Actor2Geo_CountryCode
+                        ]
                     ).filter(pl.col("ActionGeo_CountryCode").is_in(COUNTRIES_FIPS))
                     print(f"OK: {len(df)} rows extracted")
                     print(f"Sample: {df.row(0, named=True)}")
