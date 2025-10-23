@@ -1,204 +1,183 @@
-# src/preprocessing/preprocess.py
-# Preprocessing pipeline: GDELT Events + CCI → X.parquet / y.parquet
-# Fully lazy, robust, no type errors, memory-safe, tested on real data
+# preprocess.py
 import polars as pl
-from pathlib import Path
-from typing import List, Dict
-import sys
+import os
+import torch
+from tqdm import tqdm
 
-# === CONFIGURATION ===
-CCI_PATH = Path("data/cci_ocde.csv")
-EVENTS_DIR = Path("data/processed/events_by_month_filtered")
-OUTPUT_DIR = Path("data/rows")
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+# ---------------------------
+# Configuration
+# ---------------------------
+events_dir = "data/processed/events_by_month_filtered"
+cci_path = "data/cci_ocde.parquet"
+output_X = "data/X.pt"
+output_y = "data/y.pt"
+output_metadata = "data/metadata.pt"
 
-# FIPS mapping: Alpha-3 → FIPS (2-letter)
-ALPHA3_TO_FIPS: Dict[str, str] = {
-    "CHL": "CL", "CRI": "CR", "POL": "PL", "PRT": "PT", "LTU": "LT",
-    "CHN": "CH", "ITA": "IT", "FIN": "FI", "LUX": "LU", "RUS": "RU",
-    "BRA": "BR", "AUT": "AT", "BEL": "BE", "CHE": "SZ", "HUN": "HU",
-    "DEU": "GM", "MEX": "MX", "GRC": "GR", "GBR": "UK", "COL": "CO",
-    "JPN": "JA", "SWE": "SW", "IND": "IN", "KOR": "KS", "TUR": "TU",
-    "ISR": "IS", "AUS": "AS", "FRA": "FR", "NLD": "NL", "LVA": "LV",
-    "SVK": "LO", "CZE": "EZ", "IDN": "ID", "EST": "EN", "USA": "US",
-    "DNK": "DK", "IRL": "EI", "ZAF": "SA", "ESP": "SP", "NZL": "NZ", "SVN": "SI"
+SEQUENCE_LENGTH = 6  # Number of months to look back
+
+# ---------------------------
+# Mapping OCDE ISO3 -> FIPS
+# ---------------------------
+ocde_to_fips = {
+    "AUS": "AS", "AUT": "AU", "BEL": "BE", "BRA": "BR", "CAN": "CA", "CHE": "SZ",
+    "CHL": "CI", "CHN": "CH", "COL": "CO", "CRI": "CS", "CZE": "EZ", "DEU": "GM",
+    "DNK": "DA", "EST": "EN", "ESP": "SP", "FIN": "FI", "FRA": "FR", "GBR": "UK",
+    "GRC": "GR", "HUN": "HU", "IDN": "ID", "IND": "IN", "IRL": "EI", "ISR": "IS",
+    "ITA": "IT", "JPN": "JA", "KOR": "KS", "LTU": "LH", "LVA": "LG", "LUX": "LU",
+    "MEX": "MX", "NLD": "NL", "NZL": "NZ", "POL": "PL", "PRT": "PO", "RUS": "RS",
+    "SVK": "LO", "SVN": "SI", "SWE": "SW", "TUR": "TU", "USA": "US", "ZAF": "SF"
 }
 
-# === 1. LOAD CCI DATA (keep TIME_PERIOD as string "YYYY-MM") ===
-print("Loading CCI data...")
-if not CCI_PATH.exists():
-    print(f"[ERROR] CCI file not found: {CCI_PATH}")
-    sys.exit(1)
-
-cci = (
-    pl.scan_csv(str(CCI_PATH), separator=",")
-    .select(["TIME_PERIOD", "REF_AREA", "OBS_VALUE"])
-    .with_columns([
-        pl.col("TIME_PERIOD").str.strip_chars(),  # "2019-05"
-        pl.col("OBS_VALUE").cast(pl.Float64, strict=False)
-    ])
-    .filter(pl.col("TIME_PERIOD").str.lengths() == 7)  # YYYY-MM
-)
-
-# Cache intermediate
-try:
-    cci.collect().write_parquet("data/cci_ocde.parquet")
-    print("CCI cached to data/cci_ocde.parquet")
-except Exception as e:
-    print(f"[WARNING] Could not cache CCI: {e}")
-
-# === 2. GET UNIQUE MONTHS (as strings: "2019-05") ===
-print("Extracting unique months from CCI...")
-months_df = cci.select("TIME_PERIOD").unique().collect()
-
-if months_df.is_empty():
-    print("[ERROR] No valid months found in CCI data.")
-    sys.exit(1)
-
-months: List[str] = months_df["TIME_PERIOD"].to_list()
-print(f"Found {len(months)} months to process.")
-
-# === 3. PROCESS EACH MONTH: JOIN EVENTS + CCI ===
-print("Joining GDELT events with CCI by month...")
-results = []
-
-for month_str in months:  # e.g., "2019-05"
-    yyyymm = month_str.replace("-", "")  # "201905"
-
-    # --- CCI slice for this month (keep as string) ---
-    cci_month = (
-        cci.filter(pl.col("TIME_PERIOD") == month_str)
-        .with_columns(pl.lit(month_str).alias("DATE"))
-        .drop("TIME_PERIOD")
-        .collect()  # Small: one month → safe
-    )
-
-    if cci_month.is_empty():
-        print(f"Warning: no CCI data for month {month_str}, skipping")
-        continue
-
-    # --- Find event file ---
-    parquet_files = list(EVENTS_DIR.glob(f"{yyyymm}.parquet"))
-    if not parquet_files:
-        print(f"Warning: no event files for month {yyyymm}, skipping")
-        continue
-
-    events_path = parquet_files[0]
-    try:
-        dx = pl.scan_parquet(str(events_path))
-    except Exception as e:
-        print(f"[ERROR] Failed to read {events_path}: {e}")
-        continue
-
-    # --- Transform SQLDATE (i32) → DATE (string "YYYY-MM") ---
-    dx = dx.with_columns(
-        pl.col("SQLDATE")
-        .cast(pl.Utf8)
-        .str.zfill(8)
-        .str.slice(0, 6)  # "20150301" → "201503"
-        .str.to_date("%Y%m", strict=False)
-        .dt.strftime("%Y-%m")
-        .alias("DATE")
-    ).drop("SQLDATE")
-
-    # --- Lazy inner join on DATE (both strings) ---
-    joined = dx.join(
-        pl.LazyFrame(cci_month),
-        on="DATE",
-        how="inner"
-    )
-
-    results.append(joined.collect())
-
-# === 4. CONCAT ALL MONTHS ===
-if not results:
-    print("No joined data found. Creating empty output.")
-    empty_df = pl.DataFrame()
-    empty_df.write_parquet(str(OUTPUT_DIR / "data.parquet"))
-    empty_df.write_parquet(str(OUTPUT_DIR / "X.parquet"))
-    empty_df.write_parquet(str(OUTPUT_DIR / "y.parquet"))
-    sys.exit(0)
-
-print("Concatenating all monthly results...")
-all_rows = pl.concat(results, how="vertical")
-all_rows.write_parquet(str(OUTPUT_DIR / "data.parquet"))
-
-# === 5. FINAL PROCESSING (LAZY) ===
-print("Final aggregation and pivoting...")
-data = pl.scan_parquet(str(OUTPUT_DIR / "data.parquet"))
-
-# Map REF_AREA (alpha-3) → FIPS
-data = data.with_columns(
-    pl.col("REF_AREA")
-    .replace_strict(ALPHA3_TO_FIPS, default=None)
-    .alias("REF_AREA_FIPS")
-)
-
-# Drop original REF_AREA and ActionGeo_CountryCode
-data = data.drop(["REF_AREA", "ActionGeo_CountryCode"]).rename({"REF_AREA_FIPS": "REF_AREA"})
-
-# Clean EventCode
-df = data.with_columns(
-    pl.col("EventCode").cast(pl.Utf8).str.strip_chars().alias("EventCode_clean")
-).drop("EventCode")
-
-# === 6. AGGREGATE BY (REF_AREA, DATE, EventCode, OBS_VALUE) ===
-agg_df = (
-    df.group_by(["REF_AREA", "DATE", "EventCode_clean", "OBS_VALUE"])
-    .agg([
-        pl.col("NumMentions").sum().alias("NumMentions_sum"),
-        pl.col("AvgTone").mean().alias("AvgTone_mean")
-    ])
-)
-
-# === 7. PIVOT: Mentions & Tone (LAZY) ===
-print("Pivoting mentions and tone...")
-pivot_mentions = (
-    agg_df.pivot(
-        values="NumMentions_sum",
-        index=["REF_AREA", "DATE", "OBS_VALUE"],
-        columns="EventCode_clean"
-    )
-    .fill_null(0)
-    .rename(lambda col: f"Mentions_{col}" if col not in ["REF_AREA", "DATE", "OBS_VALUE"] else col)
-)
-
-pivot_tone = (
-    agg_df.pivot(
-        values="AvgTone_mean",
-        index=["REF_AREA", "DATE", "OBS_VALUE"],
-        columns="EventCode_clean"
-    )
-    .fill_null(0)
-    .rename(lambda col: f"Tone_{col}" if col not in ["REF_AREA", "DATE", "OBS_VALUE"] else col)
-)
-
-# === 8. JOIN PIVOTS + ADD INDEX ===
-final_df = pivot_mentions.join(pivot_tone, on=["REF_AREA", "DATE", "OBS_VALUE"])
-
-# Stable row index
-final_df = final_df.with_row_index("index")
-
-# === 9. ENCODE REF_AREA → Integer ID ===
-unique_areas = final_df.select("REF_AREA").unique().sort("REF_AREA")
-area_to_id = {
-    area: idx for idx, area in enumerate(unique_areas["REF_AREA"].to_list())
-}
-
-encoded_df = final_df.with_columns(
-    pl.col("REF_AREA").replace(area_to_id).cast(pl.Int32).alias("REF_AREA_ID")
+# ---------------------------
+# Load CCI
+# ---------------------------
+df_cci = pl.scan_parquet(cci_path).collect()
+df_cci = df_cci.with_columns(
+    pl.col("REF_AREA").replace(ocde_to_fips).alias("FIPS")
 ).drop("REF_AREA")
 
-# Reorder: index first
-encoded_df = encoded_df.select([
-    "index", "REF_AREA_ID", "DATE", "OBS_VALUE",
-    pl.exclude("index", "REF_AREA_ID", "DATE", "OBS_VALUE")
-])
+# Convert TIME_PERIOD to YYYYMM for merge
+df_cci = df_cci.with_columns(
+    pl.col("TIME_PERIOD").str.replace("-", "").alias("YYYYMM")
+)
 
-# === 10. WRITE FINAL X / y ===
-print(f"Writing final datasets to {OUTPUT_DIR}/")
-encoded_df.select(pl.exclude("OBS_VALUE", "DATE")).write_parquet(str(OUTPUT_DIR / "X.parquet"))
-encoded_df.select(["index", "OBS_VALUE"]).write_parquet(str(OUTPUT_DIR / "y.parquet"))
+# Compute monthly ΔCCI by country
+df_cci = (
+    df_cci.sort(["FIPS", "YYYYMM"])
+    .with_columns(
+        (pl.col("OBS_VALUE") - pl.col("OBS_VALUE").shift(1)).over("FIPS").alias("delta_cci")
+    )
+    .drop_nulls("delta_cci")
+)
 
-print(f"Done! X: {OUTPUT_DIR}/X.parquet, y: {OUTPUT_DIR}/y.parquet")
-print(f"   → {encoded_df.collect().height:,} rows, {len(encoded_df.columns)} columns")
+# ---------------------------
+# Load and aggregate events by month/country
+# ---------------------------
+all_months = []
+for month_file in tqdm(sorted(os.listdir(events_dir)), desc="Processing monthly event files"):
+    if not month_file.endswith(".parquet"):
+        continue
+    month_str = month_file.replace(".parquet", "")
+    df = pl.scan_parquet(os.path.join(events_dir, month_file)).collect()
+
+    # Extract unique countries per event
+    df = df.with_columns(
+        pl.concat_list(["ActionGeo_CountryCode", "Actor1Geo_CountryCode", "Actor2Geo_CountryCode"])
+        .list.drop_nulls()
+        .alias("countries")
+    )
+
+    df = df.explode("countries")
+
+    # Add EventRoot (first two digits of EventCode)
+    df = df.with_columns(pl.col("EventCode").str.slice(0, 2).alias("EventRoot"))
+    
+    # Filter valid EventRoots
+    df = df.filter(pl.col("EventRoot").str.contains(r"^\d{2}$"))
+
+    # Aggregate by country and EventRoot
+    agg = (
+        df.group_by(["countries", "EventRoot"])
+        .agg([
+            (pl.col("AvgTone") * pl.col("NumMentions")).sum().alias("tone_weighted_sum"),
+            pl.col("NumMentions").sum().alias("total_mentions"),
+        ])
+        .with_columns([
+            (pl.col("tone_weighted_sum") / pl.col("total_mentions")).alias("mean_tone_weighted"),
+            pl.col("total_mentions").alias("mean_mentions"),
+            pl.lit(month_str).alias("YYYYMM")
+        ])
+        .select(["countries", "EventRoot", "mean_tone_weighted", "mean_mentions", "YYYYMM"])
+    )
+    all_months.append(agg)
+
+# Combine all months
+df_all = pl.concat(all_months)
+
+# Pivot to wide format: one row per (country, month)
+df_wide = df_all.pivot(
+    values=["mean_tone_weighted", "mean_mentions"],
+    index=["countries", "YYYYMM"],
+    on="EventRoot"
+).fill_null(0)
+
+# ---------------------------
+# Merge with CCI targets
+# ---------------------------
+df_full = df_wide.join(
+    df_cci.select(["FIPS", "YYYYMM", "delta_cci"]),
+    left_on=["countries", "YYYYMM"],
+    right_on=["FIPS", "YYYYMM"],
+    how="inner"
+).sort(["countries", "YYYYMM"])
+
+print(f"Total data points: {df_full.height}")
+print(f"Countries: {df_full['countries'].n_unique()}")
+print(f"Date range: {df_full['YYYYMM'].min()} to {df_full['YYYYMM'].max()}")
+
+# ---------------------------
+# Create sequences for LSTM
+# ---------------------------
+feature_cols = [c for c in df_full.columns if c not in ("countries", "YYYYMM", "delta_cci")]
+n_features = len(feature_cols)
+
+X_sequences = []
+y_sequences = []
+metadata = []  # Store (country, end_date) for each sequence
+
+# Group by country and create sequences
+for country in tqdm(df_full["countries"].unique(), desc="Creating sequences"):
+    country_data = df_full.filter(pl.col("countries") == country).sort("YYYYMM")
+    
+    # Convert to numpy for easier slicing
+    features = country_data.select(feature_cols).to_numpy()
+    targets = country_data["delta_cci"].to_numpy()
+    dates = country_data["YYYYMM"].to_list()
+    
+    # Create sequences of length SEQUENCE_LENGTH
+    for i in range(len(features) - SEQUENCE_LENGTH):
+        X_seq = features[i:i+SEQUENCE_LENGTH]  # Shape: (seq_len, n_features)
+        y_val = targets[i+SEQUENCE_LENGTH]      # Predict next month
+        
+        X_sequences.append(X_seq)
+        y_sequences.append(y_val)
+        metadata.append({
+            "country": country,
+            "end_date": dates[i+SEQUENCE_LENGTH-1],
+            "target_date": dates[i+SEQUENCE_LENGTH]
+        })
+
+# Convert to tensors
+X = torch.tensor(X_sequences, dtype=torch.float32)  # Shape: (n_samples, seq_len, n_features)
+y = torch.tensor(y_sequences, dtype=torch.float32).unsqueeze(1)  # Shape: (n_samples, 1)
+
+# Normalize features (important for LSTM)
+X_mean = X.mean(dim=(0, 1), keepdim=True)  # Mean over samples and time
+X_std = X.std(dim=(0, 1), keepdim=True) + 1e-8
+X = (X - X_mean) / X_std
+
+# Normalize target
+y_mean = y.mean()
+y_std = y.std() + 1e-8
+y_normalized = (y - y_mean) / y_std
+
+# Save tensors and metadata
+os.makedirs("data", exist_ok=True)
+torch.save(X, output_X)
+torch.save(y_normalized, output_y)
+torch.save({
+    "X_mean": X_mean,
+    "X_std": X_std,
+    "y_mean": y_mean,
+    "y_std": y_std,
+    "feature_cols": feature_cols,
+    "sequence_length": SEQUENCE_LENGTH,
+    "metadata": metadata
+}, output_metadata)
+
+print(f"\n✅ Saved:")
+print(f"   X: {X.shape} (n_samples, seq_len, n_features)")
+print(f"   y: {y_normalized.shape} (n_samples, 1)")
+print(f"   Sequence length: {SEQUENCE_LENGTH} months")
+print(f"   Number of features: {n_features}")
+print(f"   Total sequences: {len(X_sequences)}")
