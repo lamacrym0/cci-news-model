@@ -1,14 +1,33 @@
 import polars as pl
 from pathlib import Path
 
-cci = pl.scan_parquet('data/cci_ocde.parquet')
+CCI_PARQUET = 'data/cci/cci_ocde.parquet'
+EVENTS_DIR = 'data/events/'
+DATA_DIR = 'data/rows'
+DATA_PARQUET = 'data/rows/data.parquet'
+X_PARQUET = 'data/rows/X.parquet'
+Y_PARQUET = 'data/rows/y.parquet'
 
+# FIPS mapping dictionary (Alpha-3 -> FIPS two-letter)
+alpha3_to_fips = {
+    "CHL":"CL","CRI":"CR","POL":"PL","PRT":"PT","LTU":"LT",
+    "CHN":"CH","ITA":"IT","FIN":"FI","LUX":"LU","RUS":"RU",
+    "BRA":"BR","AUT":"AT","BEL":"BE","CHE":"SZ","HUN":"HU",
+    "DEU":"GM","MEX":"MX","GRC":"GR","GBR":"UK","COL":"CO",
+    "JPN":"JA","SWE":"SW","IND":"IN","KOR":"KS","TUR":"TU",
+    "ISR":"IS","AUS":"AS","FRA":"FR","NLD":"NL","LVA":"LV",
+    "SVK":"LO","CZE":"EZ","IDN":"ID","EST":"EN","USA":"US",
+    "DNK":"DK","IRL":"EI","ZAF":"SA","ESP":"SP","NZL":"NZ","SVN":"SI"
+}
+
+cci = pl.scan_parquet(CCI_PARQUET)
 
 # collect distinct months as python strings
 months = cci.select(pl.col("TIME_PERIOD")).unique().collect().to_numpy()
 
 results = []  # collect eager DataFrames here
-events_dir = Path(f"data/events/")
+Path(EVENTS_DIR).mkdir(parents=True, exist_ok=True)
+events_dir = Path(EVENTS_DIR)
 
 for month in months:
     # filter the month from cci and prepare SQLDATE column (eager)
@@ -60,33 +79,14 @@ for month in months:
 # concatenate all month-level results and write once
 if results:
     all_rows = pl.concat(results, how="vertical")
-    Path("data/rows").mkdir(parents=True, exist_ok=True)
-    all_rows.write_parquet("data/rows/data.parquet")
+    Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
+    all_rows.write_parquet(DATA_PARQUET)
 else:
-    NameError("Missing Value GDELT or CCI OCDE")
+    print("No data to store.")
+    exit(1)
 
 print("Data saved")
-data = pl.scan_parquet('data/rows/data.parquet')
-
-# Input alpha-3 list
-alpha3_list = [
-    "CHL","CRI","POL","PRT","LTU","CHN","ITA","FIN","LUX","RUS",
-    "BRA","AUT","BEL","CHE","HUN","DEU","MEX","GRC","GBR","COL",
-    "JPN","SWE","IND","KOR","TUR","ISR","AUS","FRA","NLD","LVA",
-    "SVK","CZE","IDN","EST","USA","DNK","IRL","ZAF","ESP","NZL","SVN"
-]
-
-# FIPS mapping dictionary (Alpha-3 -> FIPS two-letter)
-alpha3_to_fips = {
-    "CHL":"CL","CRI":"CR","POL":"PL","PRT":"PT","LTU":"LT",
-    "CHN":"CH","ITA":"IT","FIN":"FI","LUX":"LU","RUS":"RU",
-    "BRA":"BR","AUT":"AT","BEL":"BE","CHE":"SZ","HUN":"HU",
-    "DEU":"GM","MEX":"MX","GRC":"GR","GBR":"UK","COL":"CO",
-    "JPN":"JA","SWE":"SW","IND":"IN","KOR":"KS","TUR":"TU",
-    "ISR":"IS","AUS":"AS","FRA":"FR","NLD":"NL","LVA":"LV",
-    "SVK":"LO","CZE":"EZ","IDN":"ID","EST":"EN","USA":"US",
-    "DNK":"DK","IRL":"EI","ZAF":"SA","ESP":"SP","NZL":"NZ","SVN":"SI"
-}
+data = pl.scan_parquet(DATA_PARQUET)
 
 # Map alpha-3 -> fips and add as new column
 data = (
@@ -153,5 +153,5 @@ encoded_df = final_df.with_columns([
 
 print("Save final data")
 
-encoded_df.select(pl.exclude('OBS_VALUE','DATE')).write_parquet('data/rows/X.parquet')
-encoded_df.select(pl.col(['index','OBS_VALUE'])).write_parquet('data/rows/y.parquet')
+encoded_df.select(pl.exclude('OBS_VALUE','DATE')).write_parquet(X_PARQUET)
+encoded_df.select(pl.col(['index','OBS_VALUE'])).write_parquet(Y_PARQUET)

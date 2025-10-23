@@ -12,7 +12,7 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, random_split
 from torch.optim import Adam
 
 from sklearn.metrics import mean_squared_error
@@ -40,12 +40,15 @@ os.makedirs(args.save_dir, exist_ok=True)
 torch.device(args.device)
 
 if args.arch == "mlp":
-    train_ds = MLPPolars(Path(args.data_dir) / "X.parquet", Path(args.data_dir) / "y.parquet")
-    val_ds   = MLPPolars(Path(args.data_dir) / "X.parquet",   Path(args.data_dir) / "y.parquet")
+    full_ds = MLPPolars(Path(args.data_dir) / "X.parquet", Path(args.data_dir) / "y.parquet")
 elif args.arch == "lstm":
-    train_ds = LSTMPolars(Path(args.data_dir) / "X.parquet", Path(args.data_dir) / "y.parquet", sequence_length=args.seq_len)
-    val_ds   = LSTMPolars(Path(args.data_dir) / "X.parquet",   Path(args.data_dir) / "y.parquet",sequence_length=args.seq_len)
-train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=False)
+    full_ds = LSTMPolars(Path(args.data_dir) / "X.parquet", Path(args.data_dir) / "y.parquet", sequence_length=args.seq_len)
+
+train_len = int(0.8 * len(full_ds))
+val_len = len(full_ds) - train_len
+train_ds, val_ds = random_split(full_ds, [train_len, val_len], generator=torch.Generator().manual_seed(42))
+
+train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
 val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False)
 
 
