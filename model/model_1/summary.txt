@@ -1,0 +1,15 @@
+
+Training summary
+----------------
+Date: 2025-10-23 14:30:04
+Device: cuda
+Samples: 5167 (train 4134, val 1033)
+Features: 40
+Best val loss: 0.699011
+Epochs run: 17
+Learning rate: 0.001
+Weight decay: 0.0001
+Batch size: 512
+Alpha (loss weight): 3.0
+Max weight: 5.0
+Model directory: models/model_1
