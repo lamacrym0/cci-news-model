@@ -104,30 +104,47 @@ df_merged = df_merged.fill_null(0)
 
 df_merged = df_merged.sort("date")
 
+# print first date and last date
+print(f"Data from {df_merged['date'].min()} to {df_merged['date'].max()}")
+exit()
+
 SEQ_LEN = 60
 
-print(df_merged.head())
-print(df_merged.columns)
-
-# On convertit le dataframe en numpy
-features = df_merged.drop(["date", "YYYYMM", "target_delta_cci"]).to_numpy()
+# Conversion en numpy
+features = df_merged.drop(["date", "YYYYMM", "target_delta_cci", "feature_delta_cci"]).to_numpy()
 targets = df_merged["target_delta_cci"].to_numpy()
+months = df_merged["YYYYMM"].to_numpy()
 
 X, y = [], []
 
-for i in range(len(features) - SEQ_LEN):
-    X.append(features[i:i+SEQ_LEN])
-    y.append(targets[i+SEQ_LEN])
+# On va créer UNE séquence par mois (many-to-one)
+unique_months = np.unique(months)
 
-X = torch.tensor(X, dtype=torch.float32)
-y = torch.tensor(y, dtype=torch.float32).unsqueeze(1)
+for month in unique_months:
+    # indices des lignes appartenant à ce mois
+    idx = np.where(months == month)[0]
+    if len(idx) == 0:
+        continue
+
+    # fin de la séquence = dernier jour de ce mois
+    idx_end = idx[-1]
+    idx_start = idx_end - SEQ_LEN + 1
+    if idx_start < 0:
+        continue  # pas assez d'historique
+
+    # features des 60 derniers jours (many-to-one)
+    X.append(features[idx_start:idx_end + 1])
+    y.append(targets[idx_end])  # ΔCCI du mois courant
+
+X = torch.tensor(np.stack(X), dtype=torch.float32)
+y = torch.tensor(np.array(y), dtype=torch.float32).unsqueeze(1)
 
 torch.save(X, output_X)
 torch.save(y, output_y)
 
 print("✅ Saved:")
-print(f"   X: {X.shape} (n_samples, seq_len, n_features)")
-print(f"   y: {y.shape} (n_samples, 1)")
+print(f"   X: {X.shape} (n_months, seq_len, n_features)")
+print(f"   y: {y.shape} (n_months, 1)")
 print(f"   Sequence length: {SEQ_LEN} days")
 print(f"   Number of features: {X.shape[2]}")
 

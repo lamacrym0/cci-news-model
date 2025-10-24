@@ -5,19 +5,22 @@ import torch.nn as nn
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from sklearn.metrics import mean_absolute_error
+import datetime as datetime
+from dateutil import relativedelta
 
 from model import make_model_big
 
 
-# ======================================================
-# ⚙️ Configuration
-# ======================================================
-MODEL_DIR = "model/model_4"
+
+# Configuration
+
+MODEL_DIR = "model/model_11"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# ======================================================
-# 📦 Load model + scalers + logs
-# ======================================================
+
+# Load model + scalers + logs
+
 ckpt_path = os.path.join(MODEL_DIR, "best_model.pt")
 scalers_path = os.path.join(MODEL_DIR, "scalers.pt")
 log_path = os.path.join(MODEL_DIR, "train_log.csv")
@@ -38,9 +41,9 @@ y_mean, y_std = scalers["y_mean"], scalers["y_std"]
 # Load logs
 df_log = pd.read_csv(log_path)
 
-# ======================================================
-# 📈 Plot training & validation loss
-# ======================================================
+
+# Plot training & validation loss
+
 plt.figure(figsize=(8,5))
 plt.plot(df_log["epoch"], df_log["train_loss"], label="Train Loss", lw=2)
 plt.plot(df_log["epoch"], df_log["val_loss"], label="Val Loss", lw=2)
@@ -54,9 +57,9 @@ plt.savefig(os.path.join(MODEL_DIR, "01_loss_curves.png"))
 plt.close()
 print("📊 Saved: 01_loss_curves.png")
 
-# ======================================================
-# 🧠 Reload model architecture
-# ======================================================
+
+# Reload model architecture
+
 model = make_model_big(
     input_dim=checkpoint["metadata"]["n_features"],
     sequence_length=hparams["SEQUENCE_LENGTH"],
@@ -70,9 +73,9 @@ model = make_model_big(
 model.load_state_dict(checkpoint["model_state"])
 model.eval()
 
-# ======================================================
-# 📊 Load data (same tensors as training)
-# ======================================================
+
+# Load data (same tensors as training)
+
 X = torch.load("data/X_us.pt")
 y = torch.load("data/y_us.pt")
 
@@ -87,13 +90,14 @@ y_norm = (y - y_mean) / y_std
 n_samples = len(X)
 n_val = int(n_samples * 0.2)
 n_train = n_samples - n_val
-val_X, val_y = X_norm[n_train:], y_norm[n_train:]
+# val_X, val_y = X_norm[n_train:], y_norm[n_train:]
+val_X, val_y = X_norm, y_norm
 
 print(f"Validation samples: {len(val_X)}")
 
-# ======================================================
-# 🔮 Make predictions
-# ======================================================
+
+# Make predictions
+
 with torch.no_grad():
     preds_norm = model(val_X.to(DEVICE)).cpu()
 
@@ -105,9 +109,16 @@ true = val_y * y_std + y_mean
 preds_np = preds.numpy().flatten()
 true_np = true.numpy().flatten()
 
-# ======================================================
-# 📈 Scatter: true vs predicted
-# ======================================================
+# save preds in a parquet file
+df_preds = pd.DataFrame({
+    "true": true_np,
+    "predicted": preds_np
+})
+df_preds.to_parquet("data/predictions_ru.parquet")
+
+
+# Scatter: true vs predicted
+
 plt.figure(figsize=(6,6))
 plt.scatter(true_np, preds_np, alpha=0.5, edgecolor="k", s=20)
 lims = [min(true_np.min(), preds_np.min()), max(true_np.max(), preds_np.max())]
@@ -122,9 +133,9 @@ plt.savefig(os.path.join(MODEL_DIR, "02_predictions_scatter.png"))
 plt.close()
 print("📊 Saved: 02_predictions_scatter.png")
 
-# ======================================================
-# 📉 Residuals plot
-# ======================================================
+
+# Residuals plot
+
 residuals = preds_np - true_np
 
 plt.figure(figsize=(8,5))
@@ -139,9 +150,9 @@ plt.savefig(os.path.join(MODEL_DIR, "03_residuals_analysis.png"))
 plt.close()
 print("📊 Saved: 03_residuals_analysis.png")
 
-# ======================================================
-# 📊 Error by magnitude
-# ======================================================
+
+# Error by magnitude
+
 abs_error = np.abs(residuals)
 bins = np.linspace(true_np.min(), true_np.max(), 20)
 digitized = np.digitize(true_np, bins)
@@ -157,14 +168,32 @@ plt.savefig(os.path.join(MODEL_DIR, "04_error_by_magnitude.png"))
 plt.close()
 print("📊 Saved: 04_error_by_magnitude.png")
 
-# ======================================================
-# 📆 Time series samples (first 200 val)
-# ======================================================
+
+# Time series samples (first 200 val)
+
+end_date = datetime.datetime(2025, 9, 30)
+
+# Calculer la date de début (138 mois avant)
+start_date = end_date - relativedelta.relativedelta(months=138)
+
+# Créer les dates mensuelles pour l'ensemble de validation
+dates = pd.date_range(start=start_date, end=end_date, freq='MS')
+# Prendre seulement les 200 premières dates si vous avez 200 samples
+dates_plot = dates[:len(true_np)]
+
+print(true_np.shape)
 plt.figure(figsize=(12,5))
-plt.plot(true_np[:200], label="True", lw=2)
-plt.plot(preds_np[:200], label="Predicted", lw=2)
+# IMPORTANT: plotter avec les dates comme axe x
+plt.plot(dates_plot, true_np, label="True", lw=2)
+plt.plot(dates_plot, preds_np, label="Predicted", lw=2)
 plt.xlabel("Time index (chronological val set)")
 plt.ylabel("ΔCCI (denormalized)")
+
+import matplotlib.dates as mdates
+plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
+plt.gca().xaxis.set_major_locator(mdates.MonthLocator(interval=12))
+plt.gcf().autofmt_xdate()  # Rotation automatique des dates
+
 plt.title("ΔCCI - Time Series (first 200 val samples)")
 plt.legend()
 plt.grid(alpha=0.3)
@@ -173,9 +202,9 @@ plt.savefig(os.path.join(MODEL_DIR, "05_time_series_samples.png"))
 plt.close()
 print("📊 Saved: 05_time_series_samples.png")
 
-# ======================================================
-# 📊 Error distribution
-# ======================================================
+
+# Error distribution
+
 plt.figure(figsize=(8,5))
 plt.hist(residuals, bins=40, color="skyblue", edgecolor="black")
 plt.axvline(0, color="r", linestyle="--")
@@ -187,9 +216,9 @@ plt.savefig(os.path.join(MODEL_DIR, "06_residual_distribution.png"))
 plt.close()
 print("📊 Saved: 06_residual_distribution.png")
 
-# ======================================================
-# 🧮 Metrics summary
-# ======================================================
+
+# Metrics summary
+
 mae = np.mean(np.abs(residuals))
 rmse = np.sqrt(np.mean(residuals**2))
 corr = np.corrcoef(preds_np, true_np)[0,1]

@@ -73,7 +73,6 @@ class DeepLSTMEncoder(nn.Module):
 class MultiHeadTemporalAttention(nn.Module):
     """
     Multi-head self-attention sur la séquence temporelle.
-    Inspiré de Transformer avec FFN.
     """
     def __init__(self, hidden_dim: int, n_heads: int = 8, dropout: float = 0.1):
         super().__init__()
@@ -171,7 +170,7 @@ class CCILSTMRegressorBig(nn.Module):
         return y
 
 
-def make_model_big(
+def make_model(
     input_dim: int,
     sequence_length: int = 6,
     hidden_dim: int = 512,

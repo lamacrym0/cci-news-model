@@ -10,17 +10,17 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, TensorDataset
 
-from model import make_model_big
+from model import make_model
 
 
-# ======================================================
-# ⚙️ Hyperparameters
-# ======================================================
+
+# Hyperparameters
+
 EPOCHS = 150
 BATCH_SIZE = 512
 LR = 1e-3
 WEIGHT_DECAY = 1e-4
-VAL_SPLIT = 0.2
+VAL_SPLIT = 0.4
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 SEED = 42
 PATIENCE = 15
@@ -41,9 +41,9 @@ FEATURE_DROPOUT = 0.1
 torch.manual_seed(SEED)
 np.random.seed(SEED)
 
-# ======================================================
-# 📂 Prepare run directory
-# ======================================================
+
+# Prepare run directory
+
 base_dir = "models"
 os.makedirs(base_dir, exist_ok=True)
 
@@ -54,9 +54,9 @@ run_dir = os.path.join(base_dir, f"model_{next_id}")
 os.makedirs(run_dir, exist_ok=True)
 print(f"Training run directory: {run_dir}")
 
-# ======================================================
-# 📊 Load data
-# ======================================================
+
+# Load data
+
 X = torch.load("data/X_us.pt")  # (N, seq_len, n_features)
 y = torch.load("data/y_us.pt")  # (N, 1)
 
@@ -67,51 +67,43 @@ print(f"Loaded X: {X.shape}, y: {y.shape}")
 print(f"Total sequences: {n_samples}, Features: {n_features}, Sequence length: {seq_len}")
 print("Note: Raw data (not normalized)")
 
-# ======================================================
-# 🔢 Normalize data (z-score)
-# ======================================================
-X_mean = X.mean(dim=(0, 1), keepdim=True)
-X_std = X.std(dim=(0, 1), keepdim=True) + 1e-8
-X_norm = (X - X_mean) / X_std
-
-y_mean = y.mean()
-y_std = y.std() + 1e-8
-y_norm = (y - y_mean) / y_std
-
-print("✅ Normalization done (z-score)")
-
-# ======================================================
-# 🔀 Chronological split
-# ======================================================
-n_val = int(n_samples * VAL_SPLIT)
+# --- split chronologique ---
+n_val   = int(n_samples * VAL_SPLIT)
 n_train = n_samples - n_val
 
-train_X, val_X = X_norm[:n_train], X_norm[n_train:]
-train_y, val_y = y_norm[:n_train], y_norm[n_train:]
+train_X_raw, val_X_raw = X[:n_train], X[n_train:]
+train_y_raw, val_y_raw = y[:n_train], y[n_train:]
 
-print(f"Train/Val split: {n_train} / {n_val}")
+# --- normalisation ---
+X_mean = train_X_raw.mean(dim=(0, 1), keepdim=True)
+X_std  = train_X_raw.std(dim=(0, 1), keepdim=True) + 1e-8
+y_mean = train_y_raw.mean()
+y_std  = train_y_raw.std() + 1e-8
 
-# ======================================================
-# 💾 Save normalization scalers
-# ======================================================
-torch.save(
-    {"X_mean": X_mean, "X_std": X_std, "y_mean": y_mean, "y_std": y_std},
-    os.path.join(run_dir, "scalers.pt")
-)
+train_X = (train_X_raw - X_mean) / X_std
+val_X   = (val_X_raw   - X_mean) / X_std
 
-# ======================================================
-# 📦 DataLoaders
-# ======================================================
+train_y = (train_y_raw - y_mean) / y_std
+val_y   = (val_y_raw   - y_mean) / y_std
+
+# sauvegarde des scalers (train-only)
+torch.save({"X_mean": X_mean, "X_std": X_std, "y_mean": y_mean, "y_std": y_std},
+           os.path.join(run_dir, "scalers.pt"))
+
+
+
+# DataLoaders
+
 train_ds = TensorDataset(train_X, train_y)
 val_ds = TensorDataset(val_X, val_y)
 
 train_dl = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True)
 val_dl = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True)
 
-# ======================================================
-# 🧠 Model
-# ======================================================
-model = make_model_big(
+
+# Model
+
+model = make_model(
     input_dim=n_features,
     sequence_length=SEQUENCE_LENGTH,
     hidden_dim=HIDDEN_DIM,
@@ -124,9 +116,9 @@ model = make_model_big(
 n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 print(f"Model parameters: {n_params:,}")
 
-# ======================================================
-# ⚖️ Loss / Optimizer / Scheduler
-# ======================================================
+
+# Loss / Optimizer / Scheduler
+
 base_criterion = nn.SmoothL1Loss(reduction="none")
 
 def weighted_smooth_l1(pred, target):
@@ -141,9 +133,9 @@ def weighted_smooth_l1(pred, target):
 optimizer = AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
 scheduler = CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-5)
 
-# ======================================================
-# 🚀 Training Loop
-# ======================================================
+
+# Training Loop
+
 best_val = float("inf")
 patience_counter = 0
 log_records = []
@@ -225,9 +217,9 @@ for epoch in range(1, EPOCHS + 1):
             print(f"Early stopping at epoch {epoch} (no improvement for {PATIENCE} epochs)")
             break
 
-# ======================================================
-# 📉 Save logs
-# ======================================================
+
+# Save logs
+
 df_log = pd.DataFrame(log_records)
 df_log.to_csv(os.path.join(run_dir, "train_log.csv"), index=False)
 
@@ -245,9 +237,9 @@ try:
 except Exception as e:
     print(f"⚠️ Could not plot loss curve: {e}")
 
-# ======================================================
-# 📋 Summary
-# ======================================================
+
+# Summary
+
 summary = f"""
 LSTM Training Summary
 {'-'*60}
